@@ -9,7 +9,7 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocket.Server({ server });
 
-// rooms: { roomId: { players: [ws, ws], seed: number, diff: number } }
+// rooms: { roomId: { players: [ws, ws], seed: number, diff: number, matrixNum: 0, debuffs: [null, null], ...} }
 const rooms = new Map();
 
 function genRoomId() {
@@ -43,12 +43,20 @@ wss.on('connection', (ws) => {
 
     switch (msg.type) {
 
-      // ── CREATE ROOM ──────────────────────────────────
       case 'create': {
         let roomId;
         do { roomId = genRoomId(); } while (rooms.has(roomId));
         const seed = Math.floor(Math.random() * 999999);
-        const room = { players: [ws], seed, diff: msg.diff || 0, started: false, scores: [null, null] };
+        const room = {
+          players: [ws],
+          seed,
+          diff: msg.diff || 0,
+          started: false,
+          matrixNum: 0, // 0-4 (5 матриц)
+          scores: [{ completedMatrices: 0, surrenders: 0 }, { completedMatrices: 0, surrenders: 0 }],
+          debuffs: [null, null], // active debuff for each player
+          matrixStartTime: null,
+        };
         rooms.set(roomId, room);
         ws.roomId = roomId;
         ws.playerIndex = 0;
@@ -64,7 +72,6 @@ wss.on('connection', (ws) => {
         break;
       }
 
-      // ── JOIN ROOM ─────────────────────────────────────
       case 'join': {
         const roomId = (msg.roomId || '').toUpperCase().trim();
         const room = rooms.get(roomId);
@@ -75,7 +82,6 @@ wss.on('connection', (ws) => {
         ws.roomId = roomId;
         ws.playerIndex = 1;
         ws.handle = msg.handle || 'ИГРОК 2';
-        // Tell joiner their info + seed
         ws.send(JSON.stringify({
           type: 'joined',
           roomId,
@@ -84,7 +90,6 @@ wss.on('connection', (ws) => {
           diff: room.diff,
           opponentHandle: room.players[0].handle,
         }));
-        // Tell host opponent joined
         broadcast(room, {
           type: 'opponent_joined',
           opponentHandle: ws.handle,
@@ -93,7 +98,6 @@ wss.on('connection', (ws) => {
         break;
       }
 
-      // ── SET DIFF (host only) ──────────────────────────
       case 'set_diff': {
         const room = rooms.get(ws.roomId);
         if (!room || ws.playerIndex !== 0) return;
@@ -102,83 +106,103 @@ wss.on('connection', (ws) => {
         break;
       }
 
-      // ── START GAME ────────────────────────────────────
       case 'start': {
         const room = rooms.get(ws.roomId);
         if (!room || ws.playerIndex !== 0 || room.players.length < 2) return;
         room.started = true;
-        room.startTime = Date.now();
-        room.scores = [null, null];
+        room.matrixNum = 0;
+        room.scores = [{ completedMatrices: 0, surrenders: 0 }, { completedMatrices: 0, surrenders: 0 }];
+        room.debuffs = [null, null];
+        const seed = Math.floor(Math.random() * 999999) + room.seed;
         broadcastAll(room, {
-          type: 'game_start',
-          seed: room.seed,
+          type: 'mp_game_start',
+          seed,
           diff: room.diff,
+          matrixNum: 0,
         });
-        console.log(`Room ${ws.roomId}: game started`);
+        console.log(`Room ${ws.roomId}: PvP started`);
         break;
       }
 
-      // ── PROGRESS UPDATE (broadcast to opponent) ───────
-      case 'progress': {
+      // Игрок нажал первую ячейку - стартует таймер
+      case 'first_pick': {
         const room = rooms.get(ws.roomId);
         if (!room) return;
-        broadcast(room, {
-          type: 'opponent_progress',
-          cracked: msg.cracked,
-          total: msg.total,
-          moves: msg.moves,
-        }, ws);
+        room.matrixStartTime = Date.now();
+        broadcast(room, { type: 'timer_start' }, ws);
         break;
       }
 
-      // ── FINISH ────────────────────────────────────────
-      case 'finish': {
+      // Игрок завершил матрицу
+      case 'matrix_complete': {
         const room = rooms.get(ws.roomId);
         if (!room) return;
-        room.scores[ws.playerIndex] = {
-          handle: ws.handle,
-          cracked: msg.cracked,
-          total: msg.total,
-          moves: msg.moves,
-          timeMs: Date.now() - room.startTime,
-          type: msg.resultType, // 'win' | 'partial' | 'fail'
-        };
-        // Tell opponent this player finished
-        broadcast(room, {
-          type: 'opponent_finished',
-          cracked: msg.cracked,
-          total: msg.total,
-          moves: msg.moves,
-          timeMs: room.scores[ws.playerIndex].timeMs,
-          resultType: msg.resultType,
-        }, ws);
-        // If both finished → send final result to everyone
-        if (room.scores[0] && room.scores[1]) {
-          const [s0, s1] = room.scores;
-          // Determine winner: more cracked → faster → fewer moves
-          let winner = null;
-          if (s0.cracked !== s1.cracked) winner = s0.cracked > s1.cracked ? 0 : 1;
-          else if (s0.timeMs !== s1.timeMs) winner = s0.timeMs < s1.timeMs ? 0 : 1;
-          else winner = s0.moves <= s1.moves ? 0 : 1;
+        room.scores[ws.playerIndex].completedMatrices++;
+        const completed = room.scores[ws.playerIndex].completedMatrices;
+        // Отправляем обоим
+        broadcastAll(room, {
+          type: 'opponent_matrix_complete',
+          playerIndex: ws.playerIndex,
+          completedMatrices: completed,
+          timeMs: Date.now() - (room.matrixStartTime || Date.now()),
+        });
+        // Проверяем победу (5 матриц)
+        if (completed >= 5) {
           broadcastAll(room, {
-            type: 'match_result',
-            winner,
+            type: 'mp_match_end',
+            winner: ws.playerIndex,
             scores: room.scores,
           });
-          console.log(`Room ${ws.roomId}: match over, winner player ${winner}`);
+          console.log(`Room ${ws.roomId}: Player ${ws.playerIndex} won!`);
         }
         break;
       }
 
-      // ── EMOTE ─────────────────────────────────────────
-      case 'emote': {
+      // Игрок сдаётся (меняет матрицу)
+      case 'surrender': {
         const room = rooms.get(ws.roomId);
         if (!room) return;
-        broadcast(room, { type: 'emote', text: msg.text, handle: ws.handle }, ws);
+        room.scores[ws.playerIndex].surrenders++;
+        const surrenders = room.scores[ws.playerIndex].surrenders;
+        // Если сдался 3 раза - проигрыш
+        if (surrenders >= 3) {
+          const winner = ws.playerIndex === 0 ? 1 : 0;
+          broadcastAll(room, {
+            type: 'mp_match_end',
+            winner,
+            scores: room.scores,
+            reason: 'surrender_limit',
+          });
+          console.log(`Room ${ws.roomId}: Player ${ws.playerIndex} surrendered too many times`);
+        } else {
+          // Переходим на новую матрицу
+          room.matrixNum++;
+          room.debuffs = [null, null];
+          const seed = Math.floor(Math.random() * 999999) + room.seed + room.matrixNum * 7919;
+          broadcastAll(room, {
+            type: 'next_matrix',
+            matrixNum: room.matrixNum,
+            seed,
+            playerSurrendered: ws.playerIndex,
+            surrendersRemaining: 3 - surrenders,
+          });
+        }
         break;
       }
 
-      // ── PING ──────────────────────────────────────────
+      // Игрок наложил дебафф на противника
+      case 'apply_debuff': {
+        const room = rooms.get(ws.roomId);
+        if (!room) return;
+        const oppIdx = ws.playerIndex === 0 ? 1 : 0;
+        room.debuffs[oppIdx] = msg.debuff; // 'slow_ice', 'hide_cells', 'smaller_buffer' и т.д.
+        broadcast(room, {
+          type: 'debuff_applied',
+          debuff: msg.debuff,
+        }, ws);
+        break;
+      }
+
       case 'ping': {
         ws.send(JSON.stringify({ type: 'pong' }));
         break;
@@ -189,7 +213,14 @@ wss.on('connection', (ws) => {
   ws.on('close', () => {
     const room = rooms.get(ws.roomId);
     if (!room) return;
-    broadcast(room, { type: 'opponent_left' }, ws);
+    if (room.started) {
+      // Противник автоматически выигрывает
+      const winner = ws.playerIndex === 0 ? 1 : 0;
+      broadcast(room, {
+        type: 'opponent_disconnected',
+        winner,
+      }, ws);
+    }
     room.players = room.players.filter(p => p !== ws);
     if (room.players.length === 0) {
       rooms.delete(ws.roomId);
@@ -200,7 +231,6 @@ wss.on('connection', (ws) => {
 
 server.listen(PORT, () => console.log(`Breach signal server on port ${PORT}`));
 
-// Clean up empty/stale rooms every 10 min
 setInterval(() => {
   const now = Date.now();
   for (const [id, room] of rooms.entries()) {
