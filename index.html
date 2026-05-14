@@ -1335,14 +1335,12 @@ setTimeout(()=>{
   },400);
 },2200);
 
-// ═══════════════════════════════════════════════════════
-// MULTIPLAYER
-// ═══════════════════════════════════════════════════════
 
-// ⚠ ЗАМЕНИ НА СВОЙ URL ПОСЛЕ ДЕПЛОЯ НА RAILWAY:
+// ═══════════════════════════════════════════════════════════════════════════
+// MULTIPLAYER PvP — 5 MATRICES, SURRENDERS, DEBUFFS
+// ═══════════════════════════════════════════════════════════════════════════
+
 const SERVER_URL = 'wss://breach-protocol-server-production.up.railway.app';
-
-const EMOTES = ['GG','ЛОЛ','БЫСТРЕЙ','ОПЕРЕЖАЮ','УДАЧИ','🔥','😈','👻'];
 
 let mpWs = null;
 let mpState = {
@@ -1350,59 +1348,42 @@ let mpState = {
   roomId: null,
   playerIndex: null,
   opponentHandle: null,
-  seed: null,
-  diff: 0,
-  opponentFinished: false,
-  opponentScore: null,
-  myScore: null,
   isHost: false,
+  inMpGame: false,
+  matrixNum: 0,
+  completedMatrices: [0, 0],
+  surrendersUsed: [0, 0],
+  myDebuff: null,
+  oppDebuff: null,
+  timerStarted: false,
+  oppMatrixComplete: false,
 };
 
-// ── CONNECTION ────────────────────────────────────────
 function mpConnect(cb) {
   if (mpWs && mpWs.readyState === WebSocket.OPEN) { if(cb) cb(); return; }
-  try {
-    mpWs = new WebSocket(SERVER_URL);
-  } catch(e) {
-    mpSetStatus('Ошибка подключения', 'err'); return;
-  }
+  try { mpWs = new WebSocket(SERVER_URL); } catch(e) { mpSetStatus('Ошибка подключения', 'err'); return; }
   mpWs.onopen = () => {
     mpState.connected = true;
     mpSetStatus('Подключено', 'ok');
     if (cb) cb();
-    // Keep-alive ping
     mpWs._ping = setInterval(() => {
-      if (mpWs.readyState === WebSocket.OPEN)
-        mpWs.send(JSON.stringify({ type: 'ping' }));
+      if (mpWs.readyState === WebSocket.OPEN) mpWs.send(JSON.stringify({ type: 'ping' }));
     }, 25000);
   };
   mpWs.onerror = () => mpSetStatus('Ошибка соединения', 'err');
-  mpWs.onclose = () => {
-    mpState.connected = false;
-    clearInterval(mpWs._ping);
-    mpSetStatus('Соединение разорвано', 'err');
-    mpHandleDisconnect();
-  };
-  mpWs.onmessage = (e) => {
-    let msg; try { msg = JSON.parse(e.data); } catch { return; }
-    mpHandleMessage(msg);
-  };
+  mpWs.onclose = () => { mpState.connected = false; clearInterval(mpWs._ping); mpSetStatus('Соединение разорвано', 'err'); };
+  mpWs.onmessage = (e) => { let msg; try { msg = JSON.parse(e.data); } catch { return; } mpHandleMessage(msg); };
 }
 
 function mpSend(obj) {
-  if (mpWs && mpWs.readyState === WebSocket.OPEN)
-    mpWs.send(JSON.stringify(obj));
+  if (mpWs && mpWs.readyState === WebSocket.OPEN) mpWs.send(JSON.stringify(obj));
 }
 
-// ── MESSAGE HANDLER ───────────────────────────────────
 function mpHandleMessage(msg) {
   switch(msg.type) {
-
     case 'created':
       mpState.roomId = msg.roomId;
       mpState.playerIndex = 0;
-      mpState.seed = msg.seed;
-      mpState.diff = msg.diff;
       mpState.isHost = true;
       showMpLobby();
       document.getElementById('mp-room-code-display').textContent = msg.roomId;
@@ -1414,8 +1395,6 @@ function mpHandleMessage(msg) {
     case 'joined':
       mpState.roomId = msg.roomId;
       mpState.playerIndex = 1;
-      mpState.seed = msg.seed;
-      mpState.diff = msg.diff;
       mpState.opponentHandle = msg.opponentHandle;
       mpState.isHost = false;
       showMpLobby();
@@ -1433,91 +1412,100 @@ function mpHandleMessage(msg) {
       break;
 
     case 'diff_changed':
-      mpState.diff = msg.diff;
       diff = msg.diff;
       mpUpdateDiffChips();
       break;
 
-    case 'game_start':
-      mpState.seed = msg.seed;
-      mpState.diff = msg.diff;
-      mpState.opponentFinished = false;
-      mpState.opponentScore = null;
-      mpState.myScore = null;
+    case 'mp_game_start':
+      mpState.inMpGame = true;
+      mpState.matrixNum = 0;
+      mpState.completedMatrices = [0, 0];
+      mpState.surrendersUsed = [0, 0];
+      mpState.timerStarted = false;
+      mpState.oppMatrixComplete = false;
       diff = msg.diff;
       closeMpOverlay();
-      mpStartGame();
+      mpStartPvPGame(msg.seed, msg.diff);
       break;
 
-    case 'opponent_progress':
-      mpUpdateOppBar(msg.cracked, msg.total, msg.moves);
+    case 'timer_start':
+      if (mpState.playerIndex === (msg.playerIndex || null)) return; // не свой таймер
+      document.getElementById('mp-opp-timer').style.display = '';
       break;
 
-    case 'opponent_finished':
-      mpState.opponentFinished = true;
-      mpState.opponentScore = msg;
-      mpUpdateOppBar(msg.cracked, msg.total, msg.moves);
-      floatWarn('⚡ ' + (mpState.opponentHandle||'СОПЕРНИК') + ' ЗАВЕРШИЛ!', 'yellow');
-      break;
-
-    case 'match_result':
-      mpShowMatchResult(msg);
-      break;
-
-    case 'emote':
-      mpShowEmoteToast(msg.handle + ': ' + msg.text);
-      break;
-
-    case 'opponent_left':
-      floatWarn('СОПЕРНИК ПОКИНУЛ МАТЧ', 'red');
-      mpState.opponentHandle = null;
-      mpState.opponentFinished = false;
-      if (active) {
-        // Game was ongoing — auto-win
-        endMatrix(true, 'all');
+    case 'opponent_matrix_complete':
+      mpState.completedMatrices[msg.playerIndex] = msg.completedMatrices;
+      mpUpdateMpScoreboard();
+      mpState.oppMatrixComplete = true;
+      floatWarn(`⚡ ${mpState.opponentHandle || 'СОПЕРНИК'} ЗАВЕРШИЛ МАТРИЦУ!`, 'yellow');
+      // Показываем дебафф кнопку противнику
+      if (msg.playerIndex === (1 - mpState.playerIndex)) {
+        document.getElementById('mp-debuff-panel').style.display = '';
       }
       break;
 
-    case 'error':
-      mpSetStatus(msg.msg, 'err');
+    case 'next_matrix':
+      mpState.matrixNum = msg.matrixNum;
+      mpState.timerStarted = false;
+      mpState.oppMatrixComplete = false;
+      mpState.myDebuff = null;
+      mpState.oppDebuff = null;
+      document.getElementById('mp-debuff-panel').style.display = 'none';
+      diff = msg.diff;
+      if (msg.playerSurrendered !== mpState.playerIndex) {
+        floatWarn(`${mpState.opponentHandle || 'СОПЕРНИК'} СДАЛСЯ (${msg.surrendersRemaining} осталось)`, 'orange');
+      }
+      startMatrix();
+      break;
+
+    case 'mp_match_end':
+      mpEndMatch(msg.winner, msg.scores, msg.reason);
+      break;
+
+    case 'debuff_applied':
+      mpState.oppDebuff = msg.debuff;
+      mpApplyDebuff(msg.debuff);
+      floatWarn(`🔴 ДЕБАФФ НАЛОЖЕН: ${mpGetDebuffName(msg.debuff)}`, 'red');
+      break;
+
+    case 'opponent_disconnected':
+      floatWarn('СОПЕРНИК ОТКЛЮЧИЛСЯ', 'red');
+      active = false;
+      clearInterval(timerInt);
+      clearInterval(iceInt);
+      setTimeout(() => mpLeave(), 2000);
       break;
   }
 }
 
-function mpHandleDisconnect() {
-  if (document.getElementById('mp-overlay').style.display !== 'none') {
-    mpSetStatus('Соединение разорвано. Попробуй снова.', 'err');
-  }
-}
-
-// ── OPEN / CLOSE UI ───────────────────────────────────
 function openMp() {
   document.getElementById('mp-overlay').style.display = 'flex';
   document.getElementById('mp-menu').style.display = '';
   document.getElementById('mp-lobby').style.display = 'none';
-  document.getElementById('mp-result-screen').style.display = 'none';
   mpSetStatus('Подключение к серверу...', '');
   mpConnect();
 }
+
 function closeMp() {
   document.getElementById('mp-overlay').style.display = 'none';
 }
+
 function closeMpOverlay() {
   document.getElementById('mp-overlay').style.display = 'none';
 }
+
 function showMpLobby() {
   document.getElementById('mp-menu').style.display = 'none';
   document.getElementById('mp-lobby').style.display = '';
-  document.getElementById('mp-result-screen').style.display = 'none';
 }
 
-// ── CREATE / JOIN ─────────────────────────────────────
 function mpCreate() {
   mpSetStatus('Создание комнаты...', '');
   mpConnect(() => {
     mpSend({ type: 'create', handle: handle, diff: diff });
   });
 }
+
 function mpJoin() {
   const code = document.getElementById('mp-join-code').value.trim().toUpperCase();
   if (code.length !== 6) { mpSetStatus('Код должен быть 6 символов', 'err'); return; }
@@ -1535,7 +1523,6 @@ function mpCopyCode() {
   });
 }
 
-// ── LOBBY ─────────────────────────────────────────────
 function mpRenderPlayers() {
   const el = document.getElementById('mp-players-list');
   el.innerHTML = '';
@@ -1562,15 +1549,15 @@ function mpShowDiffPicker() {
   el.innerHTML = '';
   ['НОВИЧОК','ФЛЭТЛАЙН','НЕЙРАЛ','БЛЭКВОЛЛ','ИЗГОЙ'].forEach((n,i) => {
     const b = document.createElement('button');
-    b.className = 'chip' + (i === mpState.diff ? ' active' : '');
+    b.className = 'chip' + (i === diff ? ' active' : '');
     b.textContent = n;
-    b.onclick = () => { mpState.diff = i; mpSend({ type: 'set_diff', diff: i }); mpUpdateDiffChips(); };
+    b.onclick = () => { diff = i; mpSend({ type: 'set_diff', diff: i }); mpUpdateDiffChips(); };
     el.appendChild(b);
   });
 }
 
 function mpUpdateDiffChips() {
-  document.querySelectorAll('#mp-diff-chips .chip').forEach((b,i) => b.classList.toggle('active', i === mpState.diff));
+  document.querySelectorAll('#mp-diff-chips .chip').forEach((b,i) => b.classList.toggle('active', i === diff));
 }
 
 function mpStart() {
@@ -1579,120 +1566,145 @@ function mpStart() {
 
 function mpLeave() {
   if (mpWs) { mpWs.close(); mpWs = null; }
-  mpState = { connected:false, roomId:null, playerIndex:null, opponentHandle:null, seed:null, diff:0, opponentFinished:false, opponentScore:null, myScore:null, isHost:false };
+  mpState = { connected:false, roomId:null, playerIndex:null, opponentHandle:null, isHost:false, inMpGame:false, matrixNum:0, completedMatrices:[0,0], surrendersUsed:[0,0], myDebuff:null, oppDebuff:null, timerStarted:false, oppMatrixComplete:false };
   document.getElementById('mp-overlay').style.display = 'none';
-  document.getElementById('mp-hud-bar').style.display = 'none';
-  document.getElementById('mp-emotes').style.display = 'none';
+  document.getElementById('mp-game-overlay').style.display = 'none';
+  active = false;
+  clearInterval(timerInt);
+  clearInterval(iceInt);
 }
 
-// ── MP GAME START ─────────────────────────────────────
-function mpStartGame() {
-  // Show mp hud
-  document.getElementById('mp-hud-bar').style.display = 'grid';
-  document.getElementById('mp-you-handle').textContent = handle;
-  document.getElementById('mp-opp-handle').textContent = mpState.opponentHandle || 'СОПЕРНИК';
-  document.getElementById('mp-you-fill').style.width = '0%';
-  document.getElementById('mp-opp-fill').style.width = '0%';
-  document.getElementById('mp-you-detail').textContent = '0/0 ICE · 0 ходов';
-  document.getElementById('mp-opp-detail').textContent = 'ожидание...';
-  // Emotes
-  const emoteEl = document.getElementById('mp-emotes');
-  emoteEl.style.display = '';
-  document.getElementById('mp-emote-btns').innerHTML = '';
-  EMOTES.forEach(e => {
-    const b = document.createElement('button');
-    b.className = 'emote-btn'; b.textContent = e;
-    b.onclick = () => { mpSend({ type: 'emote', text: e }); };
-    document.getElementById('mp-emote-btns').appendChild(b);
-  });
-  // Seeded run
+function mpStartPvPGame(seed, diff) {
+  document.getElementById('mp-game-overlay').style.display = 'flex';
+  document.getElementById('mp-game-content').style.display = '';
+  const seededRng = (() => {
+    let s = seed;
+    return () => { s = (s * 1664525 + 1013904223) & 0xffffffff; return (s >>> 0) / 0xffffffff; };
+  })();
+  window._mpRng = seededRng;
   gameMode = 'normal';
-  ['normal','training','reaction','ghost'].forEach(n => document.getElementById('mode-'+n)?.classList.toggle('active', n==='normal'));
-  closeMpOverlay();
-  startRun(mpState.seed);
+  startMatrix();
 }
 
-function mpUpdateOppBar(cracked, total, moves) {
-  const pct = total > 0 ? cracked/total*100 : 0;
-  document.getElementById('mp-opp-fill').style.width = pct + '%';
-  document.getElementById('mp-opp-detail').textContent = cracked+'/'+total+' ICE · '+moves+' ходов';
-}
-
-function mpUpdateMyBar(cracked, total, moves) {
-  const pct = total > 0 ? cracked/total*100 : 0;
-  document.getElementById('mp-you-fill').style.width = pct + '%';
-  document.getElementById('mp-you-detail').textContent = cracked+'/'+total+' ICE · '+moves+' ходов';
-}
-
-// ── EMOTE TOAST ───────────────────────────────────────
-let emoteToastTimer = null;
-function mpShowEmoteToast(text) {
-  let el = document.getElementById('emote-toast-el');
-  if (!el) { el = document.createElement('div'); el.id = 'emote-toast-el'; el.className = 'emote-toast'; document.body.appendChild(el); }
-  el.textContent = text; el.style.display = 'block';
-  clearTimeout(emoteToastTimer);
-  emoteToastTimer = setTimeout(() => { el.style.display = 'none'; }, 2500);
-}
-
-// ── MATCH RESULT ─────────────────────────────────────
-function mpShowMatchResult(msg) {
-  active = false; clearInterval(timerInt); clearInterval(iceInt);
-  document.getElementById('mp-hud-bar').style.display = 'none';
-  document.getElementById('mp-emotes').style.display = 'none';
-  closeResult();
-  const overlay = document.getElementById('mp-overlay');
-  overlay.style.display = 'flex';
-  document.getElementById('mp-menu').style.display = 'none';
-  document.getElementById('mp-lobby').style.display = 'none';
-  const rs = document.getElementById('mp-result-screen');
-  rs.style.display = 'flex';
-  const myIdx = mpState.playerIndex;
-  const isWinner = msg.winner === myIdx;
-  const isDraw = msg.scores[0] && msg.scores[1] &&
-    msg.scores[0].cracked === msg.scores[1].cracked &&
-    Math.abs(msg.scores[0].timeMs - msg.scores[1].timeMs) < 200;
-  const box = document.getElementById('mp-result-box');
-  const title = document.getElementById('mp-result-title');
-  if (isDraw) { box.className = 'mp-match-result draw'; title.className = 'mp-result-title draw'; title.textContent = 'НИЧЬЯ'; }
-  else if (isWinner) { box.className = 'mp-match-result win'; title.className = 'mp-result-title win'; title.textContent = 'ПОБЕДА!'; sndSuccess(); }
-  else { box.className = 'mp-match-result lose'; title.className = 'mp-result-title lose'; title.textContent = 'ПОРАЖЕНИЕ'; sndFail(); }
-  document.getElementById('mp-result-sub').textContent = isWinner ? 'Ты взломал сеть быстрее!' : isDraw ? 'Примерно одинаково!' : 'Соперник был быстрее.';
-  const grid = document.getElementById('mp-score-grid');
-  grid.innerHTML = '';
-  msg.scores.forEach((s, i) => {
-    if (!s) return;
-    const card = document.createElement('div');
-    card.className = 'mp-score-card' + (i === msg.winner ? ' winner' : '');
-    const timeStr = s.timeMs ? (s.timeMs/1000).toFixed(1)+'с' : '--';
-    card.innerHTML = `<div class="mp-score-name">${s.handle||'ИГРОК '+(i+1)}</div>
-      <div class="mp-score-val">${s.cracked}/${s.total} ICE</div>
-      <div class="mp-score-detail">${s.moves} ходов · ${timeStr}</div>`;
-    grid.appendChild(card);
-  });
-  // XP reward
-  if (isWinner) addXP(Math.floor(XP_WIN[diff] * 1.5));
-  else addXP(Math.floor(XP_PART[diff]));
-}
-
-function mpRematch() {
-  document.getElementById('mp-result-screen').style.display = 'none';
-  document.getElementById('mp-lobby').style.display = '';
-  mpRenderPlayers();
-  if (mpState.isHost) {
-    mpSetLobbyStatus('Нажми "Начать матч" для реванша', 'ok');
-    document.getElementById('mp-start-btn').style.display = '';
-  } else {
-    mpSetLobbyStatus('Ожидание хоста...', 'warn');
+function mpOnFirstPick() {
+  if (!mpState.timerStarted && mpState.inMpGame) {
+    mpState.timerStarted = true;
+    mpSend({ type: 'first_pick' });
   }
 }
 
-// ── HELPERS ───────────────────────────────────────────
+function mpOnMatrixComplete() {
+  if (mpState.inMpGame) {
+    mpState.completedMatrices[mpState.playerIndex]++;
+    mpUpdateMpScoreboard();
+    mpSend({ type: 'matrix_complete' });
+  }
+}
+
+function mpSurrender() {
+  if (mpState.surrendersUsed[mpState.playerIndex] >= 2) {
+    floatWarn('МАКСИМУМ СДАЧ ДОСТИГНУТ — ПРОИГРЫШ!', 'red');
+    return;
+  }
+  mpSend({ type: 'surrender' });
+}
+
+function mpShowDebuffPanel() {
+  if (!mpState.oppMatrixComplete) { floatWarn('ДЕБАФФЫ ДОСТУПНЫ ТОЛЬКО КОГДА СОПЕРНИК ЗАВЕРШИТ МАТРИЦУ', 'yellow'); return; }
+  const debuffs = [
+    { id: 'slow_ice', name: '🐢 ЗАМЕДЛИТЬ ICE', desc: 'ICE-блоки появляются медленнее' },
+    { id: 'hide_cells', name: '👁 СКРЫТЬ ЯЧЕЙКИ', desc: 'Случайные ячейки скрыты' },
+    { id: 'time_cut', name: '⏱ МИНУС ВРЕМЯ', desc: '-15 сек к таймеру' },
+  ];
+  const panel = document.getElementById('mp-debuff-menu');
+  panel.innerHTML = '<div style="font-size:10px;letter-spacing:.2em;color:var(--text-dim);margin-bottom:.8rem">ВЫБЕРИ ДЕБАФФ</div>';
+  debuffs.forEach(d => {
+    const btn = document.createElement('button');
+    btn.className = 'btn';
+    btn.style.width = '100%';
+    btn.style.marginBottom = '6px';
+    btn.textContent = d.name + ' — ' + d.desc;
+    btn.onclick = () => { mpSend({ type: 'apply_debuff', debuff: d.id }); panel.style.display = 'none'; };
+    panel.appendChild(btn);
+  });
+  const close = document.createElement('button');
+  close.className = 'btn sm danger';
+  close.style.width = '100%';
+  close.textContent = 'ОТМЕНА';
+  close.onclick = () => { panel.style.display = 'none'; };
+  panel.appendChild(close);
+  panel.style.display = '';
+}
+
+function mpUpdateMpScoreboard() {
+  document.getElementById('mp-you-matrices').textContent = mpState.completedMatrices[mpState.playerIndex] + '/5';
+  document.getElementById('mp-opp-matrices').textContent = mpState.completedMatrices[1-mpState.playerIndex] + '/5';
+  document.getElementById('mp-you-surrenders').textContent = (2 - mpState.surrendersUsed[mpState.playerIndex]) + '×';
+  document.getElementById('mp-opp-surrenders').textContent = (2 - mpState.surrendersUsed[1-mpState.playerIndex]) + '×';
+}
+
+function mpApplyDebuff(debuffId) {
+  if (debuffId === 'slow_ice') {
+    // ICE появляются в 2x медленнее
+    const cfg = DIFFS[diff];
+    if (iceInt) clearInterval(iceInt);
+    const iceMs = cfg.ice * 4 * 1000; // 2x медленнее
+    if (cfg.ice > 0) iceInt = setInterval(() => { if (active && !paused && !mpState.oppDebuff) blockCell(); }, iceMs);
+  } else if (debuffId === 'hide_cells') {
+    // Добавляем класс ghost-hidden к случайным ячейкам
+    const cells = document.querySelectorAll('.cell.available');
+    const toHide = Math.ceil(cells.length * 0.2);
+    for (let i = 0; i < toHide; i++) {
+      cells[Math.floor(Math.random() * cells.length)].classList.add('ghost-hidden');
+    }
+  } else if (debuffId === 'time_cut') {
+    timeLeft = Math.max(5, timeLeft - 15);
+    floatWarn('⏱ -15 СЕКУНД!', 'red');
+  }
+}
+
+function mpGetDebuffName(id) {
+  const map = { slow_ice: '🐢 ЗАМЕДЛЕННЫЙ', hide_cells: '👁 СКРЫТЫЙ', time_cut: '⏱ БЕЗ ВРЕМЕНИ' };
+  return map[id] || 'НЕИЗВЕСТНЫЙ';
+}
+
+function mpEndMatch(winner, scores, reason) {
+  active = false;
+  clearInterval(timerInt);
+  clearInterval(iceInt);
+  mpState.inMpGame = false;
+  closeResult();
+  document.getElementById('mp-game-overlay').style.display = 'none';
+  const overlay = document.getElementById('mp-overlay');
+  overlay.style.display = 'flex';
+  const isWin = winner === mpState.playerIndex;
+  const box = document.getElementById('mp-result-box');
+  box.className = 'mp-match-result' + (isWin ? '.win' : '.lose');
+  const title = document.getElementById('mp-result-title');
+  title.textContent = isWin ? 'ПОБЕДА! 🔥' : 'ПОРАЖЕНИЕ';
+  title.className = 'mp-result-title' + (isWin ? '.win' : '.lose');
+  if (isWin) sndSuccess(); else sndFail();
+  const grid = document.getElementById('mp-score-grid');
+  grid.innerHTML = '';
+  scores.forEach((s, i) => {
+    const card = document.createElement('div');
+    card.className = 'mp-score-card' + (i === winner ? ' winner' : '');
+    card.innerHTML = `<div class="mp-score-name">${i === mpState.playerIndex ? handle : mpState.opponentHandle}</div>
+      <div class="mp-score-val">${s.completedMatrices}/5 матриц</div>
+      <div class="mp-score-detail">сдач: ${s.surrenders}/3</div>`;
+    grid.appendChild(card);
+  });
+  if (isWin) addXP(Math.floor(XP_WIN[diff] * 2));
+  else addXP(Math.floor(XP_PART[diff]));
+}
+
 function mpSetStatus(msg, cls) {
   const el = document.getElementById('mp-conn-status');
   if (!el) return;
   el.textContent = msg;
   el.className = 'mp-status' + (cls ? ' ' + cls : '');
 }
+
 function mpSetLobbyStatus(msg, cls) {
   const el = document.getElementById('mp-lobby-status');
   if (!el) return;
@@ -1700,139 +1712,28 @@ function mpSetLobbyStatus(msg, cls) {
   el.className = 'mp-status' + (cls ? ' ' + cls : '');
 }
 
-// ── HOOK INTO GAME LOGIC ──────────────────────────────
-// Called from checkSeqs after each pick to send progress
-const _origCheckSeqs = checkSeqs;
-// Patch render to also update mp bar + send progress
-const _origRender = render;
-render = function() {
-  _origRender();
-  if (mpState.roomId && active) {
-    const done = seqs.filter(s=>s.done).length;
-    const total = seqs.length;
-    mpUpdateMyBar(done, total, moves);
-    mpSend({ type: 'progress', cracked: done, total, moves });
-  }
+// Patch pick() to call mpOnFirstPick
+const _origPick = pick;
+pick = function(idx) {
+  mpOnFirstPick();
+  _origPick(idx);
 };
 
-// Patch endMatrix to report finish to server
+// Patch endMatrix to handle MP logic
 const _origEndMatrix = endMatrix;
 endMatrix = function(ok, reason) {
-  _origEndMatrix(ok, reason);
-  if (mpState.roomId) {
-    const done = seqs.filter(s=>s.done).length;
-    const total = seqs.length;
-    const resultType = ok ? 'win' : done > 0 ? 'partial' : 'fail';
-    mpSend({ type: 'finish', cracked: done, total, moves, resultType });
-    mpState.myScore = { cracked: done, total, moves, resultType };
-  }
-};
-
-// Patch startRun to accept optional seed for MP
-const _origStartRun = startRun;
-startRun = function(seedOverride) {
-  if (seedOverride !== undefined) {
-    _mpSeedOverride = seedOverride;
+  if (mpState.inMpGame && ok && reason === 'all') {
+    mpOnMatrixComplete();
+    if (mpState.completedMatrices[mpState.playerIndex] >= 5) {
+      active = false;
+      clearInterval(timerInt);
+      clearInterval(iceInt);
+    } else {
+      startMatrix();
+    }
   } else {
-    _mpSeedOverride = null;
-  }
-  _origStartRun();
-};
-
-let _mpSeedOverride = null;
-
-// Patch startMatrix to use seeded RNG when in MP
-const _origStartMatrix = startMatrix;
-startMatrix = function() {
-  _origStartMatrix();
-};
-
-// Seeded RNG for deterministic matrix
-function seededRng(seed) {
-  let s = seed;
-  return function() {
-    s = (s * 1664525 + 1013904223) & 0xffffffff;
-    return (s >>> 0) / 0xffffffff;
-  };
-}
-
-// Patch rnd to use seeded version during mp
-let _rngFn = null;
-const _origRnd = rnd;
-// Override startMatrix to use seed when in MP mode
-const __origStartMatrix = startMatrix;
-startMatrix = function() {
-  if (_mpSeedOverride !== null) {
-    _rngFn = seededRng(_mpSeedOverride + matDepth * 7919);
-    const _origRndLocal = window.rnd;
-    window.rnd = function(arr) {
-      if (_rngFn) return arr[Math.floor(_rngFn() * arr.length)];
-      return _origRndLocal(arr);
-    };
-    __origStartMatrix();
-    window.rnd = _origRndLocal;
-    _rngFn = null;
-  } else {
-    __origStartMatrix();
+    _origEndMatrix(ok, reason);
   }
 };
 
 </script>
-
-<!-- MULTIPLAYER OVERLAY -->
-<div id="mp-overlay" class="mp-overlay" style="display:none">
-  <!-- SCREEN: main menu -->
-  <div id="mp-menu" class="mp-box">
-    <div class="corner-deco tl"></div><div class="corner-deco tr"></div>
-    <div class="corner-deco bl"></div><div class="corner-deco br"></div>
-    <div class="mp-title">МУЛЬТИПЛЕЕР // PvP ВЗЛОМ</div>
-    <div class="mp-status" id="mp-conn-status">Подключение к серверу...</div>
-    <button class="btn" style="width:100%;margin-bottom:.5rem" onclick="mpCreate()">[ СОЗДАТЬ КОМНАТУ ]</button>
-    <div class="mp-sep">— или —</div>
-    <input class="mp-input" id="mp-join-code" maxlength="6" placeholder="Введи код комнаты (6 символов)" autocomplete="off" spellcheck="false">
-    <button class="btn" style="width:100%" onclick="mpJoin()">[ ВОЙТИ В КОМНАТУ ]</button>
-    <div style="margin-top:1rem;text-align:right">
-      <button class="btn sm danger" onclick="closeMp()">ЗАКРЫТЬ</button>
-    </div>
-  </div>
-
-  <!-- SCREEN: lobby (waiting for opponent) -->
-  <div id="mp-lobby" class="mp-box" style="display:none">
-    <div class="corner-deco tl"></div><div class="corner-deco tr"></div>
-    <div class="corner-deco bl"></div><div class="corner-deco br"></div>
-    <div class="mp-title" id="mp-lobby-title">ЛОББИ</div>
-    <div style="margin-bottom:1rem">
-      <div style="font-size:10px;color:var(--text-dim);letter-spacing:.15em;margin-bottom:6px">КОД КОМНАТЫ — нажми чтобы скопировать</div>
-      <div class="mp-room-code" id="mp-room-code-display" onclick="mpCopyCode()">------</div>
-      <div style="font-size:9px;color:var(--text-dim);letter-spacing:.12em;text-align:center" id="mp-copy-hint">Отправь этот код другу</div>
-    </div>
-    <div class="mp-lobby" id="mp-players-list"></div>
-    <div class="mp-status" id="mp-lobby-status">Ожидание соперника...</div>
-    <div id="mp-diff-row" style="display:none;margin-bottom:.8rem">
-      <div style="font-size:9px;color:var(--text-dim);letter-spacing:.15em;margin-bottom:6px">СЛОЖНОСТЬ</div>
-      <div style="display:flex;gap:6px;flex-wrap:wrap" id="mp-diff-chips"></div>
-    </div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap">
-      <button class="btn" id="mp-start-btn" onclick="mpStart()" style="display:none">[ НАЧАТЬ МАТЧ ]</button>
-      <button class="btn sm danger" onclick="mpLeave()">ПОКИНУТЬ</button>
-    </div>
-  </div>
-
-  <!-- SCREEN: match result -->
-  <div id="mp-result-screen" style="display:none;flex-direction:column;align-items:center;gap:12px">
-    <div class="mp-match-result" id="mp-result-box">
-      <div class="corner-deco tl"></div><div class="corner-deco tr"></div>
-      <div class="corner-deco bl"></div><div class="corner-deco br"></div>
-      <div class="mp-result-title" id="mp-result-title"></div>
-      <div id="mp-result-sub" style="font-size:11px;color:var(--text-dim);margin-bottom:1rem;letter-spacing:.08em"></div>
-      <div class="mp-score-grid" id="mp-score-grid"></div>
-      <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:.5rem">
-        <button class="btn" onclick="mpRematch()">[ РЕВАНШ ]</button>
-        <button class="btn sm danger" onclick="mpLeave()">ВЫЙТИ</button>
-      </div>
-    </div>
-  </div>
-</div>
-
-</body>
-</html>
