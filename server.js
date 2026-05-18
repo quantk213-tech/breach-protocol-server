@@ -179,15 +179,15 @@ wss.on('connection', (ws) => {
       }
 
       // ────────────────────────────────────────────────────
-      // Прогресс — закрашенные клетки, заполненный буфер, кол-во закрытых seq
-      // Транслируем сопернику для real-time превью
+      // Прогресс — дельта-апдейты от клиента: 'init' (старт), 'pick' (одна клетка), 'time'
+      // Просто форвардим сопернику.
       case 'progress': {
         const room = rooms.get(ws.roomId);
         if (!room) return;
         broadcast(room, {
           type: 'opp_progress',
           playerIndex: ws.playerIndex,
-          progress: msg.progress, // { picked:[idx...], bufLen, seqsDone, seqsTotal, timeLeft }
+          progress: msg.progress,
         }, ws);
         break;
       }
