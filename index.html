@@ -1348,6 +1348,36 @@ function startRun(){
   startMatrix();
 }
 
+// Возвращает все перестановки массива (для подбора порядка seq)
+function _permsOf(arr){
+  if(arr.length<=1) return [arr];
+  const result=[];
+  for(let i=0;i<arr.length;i++){
+    const rest=[...arr.slice(0,i),...arr.slice(i+1)];
+    for(const p of _permsOf(rest)) result.push([arr[i],...p]);
+  }
+  return result;
+}
+
+// Симулирует, что игрок ввёл pathCodes по порядку, и проверяет — все ли seq matched.
+// Использует тот же reset-алгоритм что в checkSeqs(): если код не совпал, matched=(cells[0]===code)?1:0.
+function _simulateSeqs(pathCodes, seqsArr){
+  const sim = seqsArr.map(s=>({cells:s.cells, matched:0, done:false}));
+  for(const code of pathCodes){
+    for(const s of sim){
+      if(s.done) continue;
+      if(code===s.cells[s.matched]){
+        s.matched++;
+        if(s.matched===s.cells.length) s.done=true;
+      } else {
+        s.matched=(s.cells[0]===code)?1:0;
+        if(s.matched===s.cells.length) s.done=true;
+      }
+    }
+  }
+  return sim.every(s=>s.done);
+}
+
 function startMatrix(){
   const cfg=DIFFS[diff];
   size=cfg.size;bufLen=cfg.bufLen+(ownedImplants.has('buffer_plus')?2:0);
@@ -1355,15 +1385,35 @@ function startMatrix(){
   timeLeft=(cfg.time+(ownedImplants.has('time_boost')?8:0))*(gameMode==='training'?999:1);
   maxTime=timeLeft;active=true;traps=new Set();blocked=new Set();ghostTimers={};
   const shuffled=[...DEMONS].sort(()=>Math.random()-.5);
-  seqs=cfg.seqs.map((s,si)=>({cells:Array.from({length:s.l},()=>rnd(CODES)),reward:s.r,matched:0,done:false,demon:shuffled[si%shuffled.length],critical:si===0&&diff>=3}));
   const total=size*size;
-  // Гарантированно решаемая генерация: 5 попыток + валидатор
-  let attempt=0, success=false, usedPos=new Set();
-  while(attempt<5 && !success){
-    attempt++;
-    usedPos=new Set();
-    grid=Array.from({length:total},()=>rnd(CODES));
-    const pathCodes=seqs.flatMap(s=>s.cells);
+  // Гарантированно решаемая генерация.
+  // Шаги:
+  //   1. Регенерируем seqs до 30 раз пока не найдётся перестановка их порядка,
+  //      при которой checkSeqs не "ломается" каскадными reset'ами.
+  //   2. Строим путь по правилу row<->col, кладём pathCodes по нему.
+  //   3. Шум — с запретом на код pathCells, "ожидающий" игрока на той же линии.
+  let pathCells=[], usedPos=new Set(), bestOrder=null;
+  for(let regen=0;regen<30;regen++){
+    seqs=cfg.seqs.map((s,si)=>({cells:Array.from({length:s.l},()=>rnd(CODES)),reward:s.r,matched:0,done:false,demon:shuffled[si%shuffled.length],critical:si===0&&diff>=3}));
+    const indices=seqs.map((_,i)=>i);
+    const perms=_permsOf(indices);
+    bestOrder=null;
+    for(const perm of perms){
+      const orderedCodes=perm.flatMap(i=>seqs[i].cells);
+      if(_simulateSeqs(orderedCodes,seqs)){bestOrder=perm;break;}
+    }
+    if(bestOrder) break;
+  }
+  if(!bestOrder){
+    // Fallback (теоретически не должно достичь): порядок как есть
+    bestOrder=seqs.map((_,i)=>i);
+  }
+  // Строим путь
+  const orderedSeqs=bestOrder.map(i=>seqs[i]);
+  const pathCodes=orderedSeqs.flatMap(s=>s.cells);
+  let pathBuilt=false;
+  for(let attempt=0;attempt<10&&!pathBuilt;attempt++){
+    usedPos=new Set();pathCells=[];
     let curDir='row', curLine=0, pathOk=true;
     for(let i=0;i<pathCodes.length;i++){
       const candidates=[];
@@ -1372,38 +1422,33 @@ function startMatrix(){
         if(!usedPos.has(idx)) candidates.push(idx);
       }
       if(!candidates.length){pathOk=false;break;}
-      const pick=candidates[Math.floor(Math.random()*candidates.length)];
-      grid[pick]=pathCodes[i];
-      usedPos.add(pick);
-      if(curDir==='row'){curLine=pick%size;curDir='col';}
-      else{curLine=Math.floor(pick/size);curDir='row';}
+      const pickIdx=candidates[Math.floor(Math.random()*candidates.length)];
+      pathCells.push({idx:pickIdx,code:pathCodes[i],dir:curDir,line:curLine});
+      usedPos.add(pickIdx);
+      if(curDir==='row'){curLine=pickIdx%size;curDir='col';}
+      else{curLine=Math.floor(pickIdx/size);curDir='row';}
     }
-    // Валидация: симулируем игру по построенному пути и проверяем что все seq matched
-    if(pathOk){
-      const simBuf=[];const simSeqs=seqs.map(s=>({cells:s.cells,matched:0,done:false}));
-      // Восстанавливаем последовательность ходов
-      let cd='row', cl=0; const ordered=[];
-      const usedCopy=new Set(usedPos);
-      // Реконструкция: проходим по pathCodes в порядке, ищем ячейку с этим кодом на тек. линии
-      const tempUsed=new Set();
-      for(let i=0;i<pathCodes.length;i++){
-        const code=pathCodes[i];
-        let found=-1;
-        for(let k=0;k<size;k++){
-          const idx=cd==='row'?cl*size+k:k*size+cl;
-          if(!tempUsed.has(idx)&&grid[idx]===code){found=idx;break;}
-        }
-        if(found<0){pathOk=false;break;}
-        tempUsed.add(found);
-        simBuf.push(code);
-        // Проверяем seq matched
-        simSeqs.forEach(s=>{if(s.done) return;if(code===s.cells[s.matched]){s.matched++;if(s.matched===s.cells.length) s.done=true;}else{s.matched=(s.cells[0]===code)?1:0;if(s.matched===s.cells.length) s.done=true;}});
-        if(cd==='row'){cl=found%size;cd='col';}else{cl=Math.floor(found/size);cd='row';}
-      }
-      if(pathOk&&simSeqs.every(s=>s.done)) success=true;
-    }
+    if(pathOk) pathBuilt=true;
   }
-  // Ловушки — только в ячейках вне пути
+  grid=new Array(total).fill(null);
+  // Запрет шума на коде ожидаемого pathCell на той же линии
+  const banned={};
+  pathCells.forEach(pc=>{
+    for(let k=0;k<size;k++){
+      const idx=pc.dir==='row'?pc.line*size+k:k*size+pc.line;
+      if(usedPos.has(idx)) continue;
+      if(!banned[idx]) banned[idx]=new Set();
+      banned[idx].add(pc.code);
+    }
+  });
+  for(let i=0;i<total;i++){
+    if(usedPos.has(i)) continue;
+    const forbid=banned[i]||new Set();
+    const allowed=CODES.filter(c=>!forbid.has(c));
+    grid[i]=allowed.length?rnd(allowed):rnd(CODES);
+  }
+  pathCells.forEach(pc=>{grid[pc.idx]=pc.code;});
+  // Ловушки — только вне пути
   if(cfg.trap>0){
     const tc=Math.floor(total*cfg.trap);
     const freeForTraps=[];
